@@ -20,12 +20,22 @@ import { ApprovalChannel, type ApprovalChannelContext } from '../features/approv
 import { decodeButtonData } from '../features/button-utils.ts';
 import { buildUserAgent } from '../shared/index.ts';
 import type { ImQQBotConfig } from '../config.ts';
-import type { ChatScope, Logger } from '../types.ts';
+import type { ChatScope, Logger, ReplyTarget } from '../types.ts';
 import { setupMiddlewares } from './middleware-setup.ts';
 import { startMediaCleanup } from '../media/media-cleaner.ts';
 import { ensureVisionInputModal, registerDescribeImageTool } from '../media/vision-tool.ts';
 import { registerSendFileTool, type MediaSenderLike } from '../media/send-file-tool.ts';
 import { DeliverablesDeliverer } from '../transport/deliverables.ts';
+import { BindingStore, SessionBridge, parsePeerKey, type SessionControllerLike } from '../bridge/index.ts';
+import { chunkMarkdownText } from '../transport/chunker.ts';
+
+/**
+ * 已绑定会话的出站轮询间隔。
+ *
+ * 500ms 是「够快」与「别空转」的折中：snapshotEvents 是内存数组，几个会话的
+ * 轮询成本远低于一次网络请求；再快也不会有收益，慢过 1s 会有明显延迟感。
+ */
+const RELAY_INTERVAL_MS = 500;
 
 /**
  * interaction 统一分发器：按 button_data 的顶层 `t` 判别字段，路由到对应
@@ -50,6 +60,42 @@ export async function bootstrapGateway(
 ): Promise<void> {
   const manager = new SessionManager(ctx, agents, config, logger);
 
+  // ── 会话桥：把 QQ peer 绑到宿主真实会话上（/list /use /new ...） ──
+  // sessionController 由 dsh-web-app 组合提供；只装 dsh-base 的 profile 里没有，
+  // 此时 bridge.available=false，命令回一句明确原因而不是静默失败。
+  const bindingStore = new BindingStore({ debugLog: (message) => logger.debug('bridge: ' + message) });
+  const bridge = new SessionBridge({
+    ctx: ctx as unknown as { get(name: string): unknown },
+    logger,
+    store: bindingStore,
+    send: async (peerKey, text) => {
+      const parsed = parsePeerKey(peerKey);
+      if (parsed === undefined) return;
+      const target: ReplyTarget = { scope: parsed.scope, targetId: parsed.peerId };
+      for (const chunk of chunkMarkdownText(text, config.textChunkLimit)) {
+        await sender.sendMarkdown(target, chunk);
+      }
+    },
+  });
+  // ── 绑定能力按需注入 ──
+  // session-controller 属于 dsh-web-app 组合，且可能晚于本插件注册：apply() 那一刻
+  // ctx.get('sessionController') 常常还是 undefined（实测 desktop 组合即如此）。
+  // 用 inject 等它出现，服务替换/卸载时回调重跑，状态在终端自曝一次。
+  (ctx as unknown as {
+    inject(deps: readonly string[], callback: (scoped: Context) => void): unknown;
+  }).inject(['sessionController'], (scoped) => {
+    const controller = (scoped as unknown as { sessionController?: SessionControllerLike }).sessionController;
+    bridge.setController(controller);
+    const state = controller === undefined
+      ? '会话绑定不可用（sessionController 未就绪）'
+      : '会话绑定已启用（sessionController 可用）';
+    logger.info(`im-qqbot: ${state}`);
+    console.log(`[im-qqbot] ${state}`);
+    (scoped as unknown as { effect(fn: () => () => void, name?: string): void }).effect(() => {
+      return () => bridge.setController(undefined);
+    }, 'im-qqbot.bridge-controller');
+  });
+
   // ── 初始化 QQ Bot SDK ──
   const userAgent = buildUserAgent();
   const bot = new QQBot({
@@ -64,7 +110,7 @@ export async function bootstrapGateway(
   logger.info(`QQBot SDK initialized (UA: ${userAgent})`);
 
   // ── 中间件链 ──
-  setupMiddlewares(bot, config, manager, logger);
+  setupMiddlewares(bot, config, manager, logger, bridge);
 
   // ── 入站：经过中间件链后的消息交给 dsh agent ──
   bot.on('message', async (mCtx: MiddlewareContext) => {
@@ -74,7 +120,7 @@ export async function bootstrapGateway(
     if (config.debug) {
       logger.debug(`← message (post-middleware): ${JSON.stringify(msg, null, 2).slice(0, 500)}`);
     }
-    await handleInbound(mCtx, manager, config, logger);
+    await handleInbound(mCtx, manager, config, logger, bridge);
   });
 
   // ── 出站：dsh session/event → QQ 消息 ──
@@ -116,6 +162,27 @@ export async function bootstrapGateway(
   const outbound = createOutboundHandler(manager, sender, config, logger, toolsRegistry, deliverablesDeliverer);
   (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void): void })
     .on('session/event', outbound.routeSessionEvent as (...args: unknown[]) => void);
+
+  // ── 会话桥出站：宿主会话的 assistant 输出转发到订阅它的 QQ peer ──
+  (ctx as unknown as { on(event: string, handler: (...args: unknown[]) => void): void })
+    .on('session/event', ((session: { header?: { id?: string } }, event: { type?: string; data?: Record<string, unknown> }) => {
+      const sessionId = session?.header?.id;
+      if (typeof sessionId !== 'string') return;
+      // 插件私有会话走 OutboundRouter（带流式与工具卡片），这里跳过避免重复发送
+      if (manager.findBySessionId(sessionId) !== undefined) return;
+      bridge.onSessionEvent(sessionId, event?.type ?? '', event?.data ?? {});
+    }) as (...args: unknown[]) => void);
+
+  // ── 会话桥出站（轮询兜底） ──
+  // 上面那个 ctx.on 只对「同 fiber 的插件私有会话」有效：宿主会话在自己的
+  // ctx 作用域派发 session/event，兄弟作用域收不到。所以已绑定会话额外用
+  // snapshotEvents 轮询补发——这正是 /use 绑到宿主会话后回复不回 QQ 的原因。
+  const relayTimer = setInterval(() => bridge.pollBoundSessions(), RELAY_INTERVAL_MS);
+  (relayTimer as unknown as { unref?: () => void }).unref?.();
+  (ctx as unknown as { effect(fn: () => (() => void) | void, name?: string): void })
+    .effect(() => () => {
+      clearInterval(relayTimer);
+    }, 'im-qqbot.bridge-relay');
 
   // ── 出站流式：agent/assistant-stream → 流式帧路由 ──
   // 实时流式走瞬态 agent/assistant-stream（chunk 不进 session log）。
@@ -190,7 +257,18 @@ export async function bootstrapGateway(
     .effect(() => {
       logger.info(`Starting bot (appId=${config.appId})`);
       bot.start().catch((err: unknown) => {
-        logger.error(`Bot start failed: ${err instanceof Error ? err.message : String(err)}`);
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error(`Bot start failed: ${message}`);
+        // 连接失败必须在终端可见：静默失败会被误读成「机器人只是不响应」，
+        // 而去查网络、查群权限，真正的原因却在凭据上。
+        console.error(`[im-qqbot] 机器人连接失败：${message}`);
+
+        if (!isCredentialFailure(message)) return;
+        // 这里只负责把话说清楚：真正的自救在 apply() —— 下次启动会用
+        // probeCredentials 判定失效并直接转入扫码流程（本轮已过期，无法就地重启）
+        console.error('[im-qqbot] 凭据无效（invalid appid or secret）。');
+        console.error('[im-qqbot] 修法二选一：① QQ 开放平台 → 开发设置 重置 AppSecret 后写回 profile 的 cordis.patch.yml；');
+        console.error('[im-qqbot]             ② 删掉 im-qqbot 下的 appId/appSecret 两行（或 ~/.dsh/.env 里的 QQBOT_*），重启后按提示重新扫码。');
       });
 
       return async () => {
@@ -199,4 +277,13 @@ export async function bootstrapGateway(
         bot.stop();
       };
     }, 'im-qqbot.lifecycle');
+}
+/**
+ * 判断一次启动失败是否属于「凭据失效」。
+ *
+ * SDK 的报错形如 `Failed to get access_token: {"code":100016,"message":"invalid appid or secret"}`，
+ * 平台也偶发改「appid or secret is invalid」之类的措辞，故按关键字匹配而不是精确比对。
+ */
+function isCredentialFailure(message: string): boolean {
+  return /invalid appid or secret|appid or secret is invalid|100016|get access_token/i.test(message);
 }

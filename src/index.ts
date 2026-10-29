@@ -11,6 +11,7 @@ import { bootstrapGateway } from './gateway/index.ts';
 import type { DshAgentRegistry } from './session/index.ts';
 import { getProfileDir, resolveEnv } from './shared/index.ts';
 import { ensureCredentials, persistCredentialsToProfile, registerBoundCredentialRoutes } from './setup/index.ts';
+import { probeCredentials } from './setup/credential-probe.ts';
 import type { Logger } from './types.ts';
 
 // ── Cordis 插件元数据 ──
@@ -27,6 +28,19 @@ export async function apply(ctx: Context, config: ImQQBotConfig): Promise<void> 
 
   let appId = resolveEnv(config.appId, 'QQBOT_APPID');
   let appSecret = resolveEnv(config.appSecret, 'QQBOT_SECRET');
+
+  // ── 已存凭据先预检：平台轮换密钥后 profile 里那份会静默失效 ──
+  // 只认「平台明确说无效」（100016）；网络问题一律按已绑定继续，
+  // 否则断一次网就会把用户踢回扫码流程。
+  if (appId && appSecret) {
+    const probe = await probeCredentials(appId, appSecret, logger);
+    if (probe === 'invalid') {
+      logger.warn('已存凭据被平台拒绝（invalid appid or secret），转入扫码绑定');
+      console.error('[im-qqbot] 已存凭据已失效（invalid appid or secret），正在重新扫码绑定…');
+      appId = '';
+      appSecret = '';
+    }
+  }
 
   // ── 凭据缺失时唤起扫码绑定 ──
   if (!appId || !appSecret) {

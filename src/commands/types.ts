@@ -5,11 +5,14 @@
  */
 import type { SlashCommand } from '@tencent-connect/qqbot-nodejs';
 import type { SessionManager } from '../session/index.ts';
+import type { SessionBridge } from '../bridge/index.ts';
 import type { ImQQBotConfig } from '../config.ts';
 
 export interface CommandDeps {
   manager: SessionManager;
   config: ImQQBotConfig;
+  /** 宿主会话桥：/list /use /current /unuse /new /status 依赖它 */
+  bridge: SessionBridge;
 }
 
 /** 命令分类：agent = 底层 agent 通用能力，qqbot = 插件特有 */

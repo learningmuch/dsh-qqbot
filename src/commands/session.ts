@@ -9,10 +9,15 @@
 import type { CommandDeps, CategorizedCommand } from './types.ts';
 import { getScopePeer } from '../shared/index.ts';
 
-/** /new（别名 /reset /clear）— 开始新会话 */
-export function newCommand({ manager }: CommandDeps): CategorizedCommand {
+/** /reset（别名 /clear）— 重置插件私有会话
+ *
+ * 注意：`/new` 已交给会话桥（见 ./bridge.ts）：绑定了宿主会话时它新建一个宿主会话，
+ * 没有绑定时仍然只是重置这里的插件会话。两者语义都是「开一个新会话」，
+ * 但底层对象不同，故拆成两个命令名，避免同一个名字对应两种会话模型。
+ */
+export function resetCommand({ manager }: CommandDeps): CategorizedCommand {
   return {
-    name: ['new', 'reset', 'clear'],
+    name: ['reset', 'clear'],
     category: 'agent',
     description: '开始新会话（清空上下文）',
     handler: (cmdCtx) => {

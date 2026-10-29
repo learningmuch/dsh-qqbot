@@ -151,7 +151,18 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 
 | 命令 | 说明 |
 |------|------|
-| `/new`（别名 `/reset` `/clear`） | 开始新会话（清空上下文） |
+| `/list` | 列出宿主会话（序号 / 标题 / 目录 / 运行中），点击序号即可绑定 |
+| `/list-all [n]` | 同上，按最近活跃排序取前 n 条（默认 50，上限 200） |
+| `/use <序号\|ID前缀> [提示词]` | 把当前 QQ 会话绑定到某个宿主会话，可顺带投递一句提示词 |
+| `/current` | 查看当前绑定与目标会话状态 |
+| `/unuse` | 解除绑定，回到插件私有会话 |
+| `/new [--dir <绝对路径>] [标题]` | 新建宿主会话并绑定（均已绑定时）；未绑定且无参数时等价于重置当前会话 |
+| `/status [序号]` | 查看绑定会话（或指定序号会话）的详细状态 |
+| `/watch [序号\|ID前缀]` | 订阅某个会话的输出（只收转发、不接管输入；不带参数订阅当前绑定） |
+| `/unwatch [序号\|ID前缀]` | 取消订阅（不带参数清空全部） |
+| `/search <关键词>` | 按标题 / 工作目录 / ID 搜索会话，结果可直接 `/use <序号>` |
+| `/summary [序号\|ID前缀]` | 查看会话最近几轮问答（不带参数看当前绑定） |
+| `/reset`（别名 `/clear`） | 重置当前插件会话（清空上下文） |
 | `/compact` | 压缩会话历史（摘要替换旧记录，保留上下文） |
 | `/model` | 查看或切换模型 |
 | `/preset` | 查看或切换 agent preset（新会话生效） |
@@ -160,6 +171,43 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 | `/bot-version` | 查看版本信息 |
 | `/bot-status` | 查看当前会话状态 |
 | `/bot-help` | 查看所有指令 |
+
+## 会话绑定（宿主会话同步）
+
+默认情况下每个 QQ 会话对应插件内的一个私有 agent 会话，与桌面版 / Web 里的会话互不相通。
+**会话绑定**把某个 QQ 会话（单聊按 openid、群聊按 group_openid）指向一个**宿主会话**，
+两边从此是同一个会话：
+
+- QQ 发来的消息直接投递进目标会话（`sessionController.prompt`），不再创建私有 agent；
+- 目标会话每轮结束时，把 assistant 的文本回复转发回 QQ；
+- 桌面版 / Web 里的操作（切换模型、发消息、看结果）与 QQ 侧看到的是同一份上下文。
+
+### 前提
+
+需要 profile 里同时具备 `@deepseek-ai/dsh-web-app`（提供 `sessionController`）。
+只装 `dsh-base` 时绑定能力不可用，`/list` 会明确提示而不是静默失败。
+
+插件通过 `ctx.inject(['sessionController'], …)` 探测该能力：服务晚于插件注册也能拿到，
+控制台会打印一次 `[im-qqbot] 会话绑定已启用（sessionController 可用）` 作为部署自检。
+
+### 典型流程
+
+```
+/list                  → 看到桌面版里的会话列表
+/use 3                 → 绑定第 3 个会话（也可 /use a1b2c3d4 用 ID 前缀）
+/current               → 确认绑定
+（在 QQ 里直接聊，回复会同步回桌面版会话）
+/unuse                 → 解除，回到插件私有会话
+```
+
+### 实现要点
+
+| 事项 | 说明 |
+|------|------|
+| 绑定落盘 | `~/.dsh-qqbot/bindings.json`，按 `qqbot:<appId>:<scope>:<peerId>` 存 sessionId，进程重启后仍有效 |
+| 入站 | `handleInbound` 前置分流：有绑定且能力可用 → `bridge.prompt()`，失败回一句 `⚠️ 投递到绑定会话失败：…` |
+| 出站 | 监听 `session/event` 的 `turn/end`，取本轮 `assistant/message` 文本转发；插件私有会话不参与转发 |
+| 中继保真度 | 按轮转发纯文本（无流式增量、无工具卡片、无附件）——刻意收窄，避免与流式出站路径互相干扰 |
 
 ## 核心模块
 
@@ -178,11 +226,15 @@ src/
 ├── client/                     # 浏览器半边（dsh.client Web Bundle）
 │   ├── index.ts                # 侧栏 Tab 注册 + 待绑定自动引导
 │   └── bind-page.ts             # 端内绑定页（二维码 + 状态轮询）
+├── bridge/                     # 宿主会话绑定（/list /use 等）
+│   ├── binding-store.ts        # peerKey → sessionId 落盘
+│   ├── session-bridge.ts       # 能力探测 + 列表/解析/投递/中继
+│   └── index.ts                # 模块出口
 ├── gateway/                    # 网关装配
 │   ├── bootstrap.ts            # 启动装配（监听 session/event 等）
 │   └── middleware-setup.ts     # 中间件链配置
 ├── transport/                  # 传输层
-│   ├── inbound.ts              # QQ 入站消息 → agent.followup()
+│   ├── inbound.ts              # QQ 入站消息 → 绑定会话 prompt / agent.followup()
 │   ├── outbound.ts             # session/event → QQ sendMarkdown
 │   ├── outbound-buffer.ts      # 流式缓冲
 │   ├── streaming-writer.ts     # 流式写入
@@ -213,12 +265,15 @@ src/
 │   ├── utils.ts                # 通用函数
 │   ├── scope.ts                # scope/peer 提取
 │   └── send-helper.ts          # 分块发送
-└── commands/                   # 斜杠命令
+├── commands/                   # 斜杠命令
+│   └── bridge.ts               # /list /use /current /unuse /new /status
 ```
 
 ## 会话路由
 
 sessionKey: `qqbot:${appId}:${scope}:${peerId}`，新会话铸造 UUID 会话 id 并持久化到 `model-prefs.json`，重启后按持久化 id 恢复；0.5.x 老会话按原派生 id 沿用。
+
+**绑定优先**：`/use` 建立绑定后，该 peer 的消息不再走上述派生会话，而是投递到绑定的宿主会话（见上一节）。
 
 解析策略：进程内复用 → 持久化恢复 → 全新创建。
 

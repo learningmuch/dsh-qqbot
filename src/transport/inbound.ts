@@ -11,6 +11,7 @@
 import type { ContentBlock } from '@deepseek-ai/dsh-llm';
 import { createUserMessage } from '@deepseek-ai/dsh-llm';
 import type { SessionManager } from '../session/index.ts';
+import { peerKeyOf, type SessionBridge } from '../bridge/index.ts';
 import type { ImQQBotConfig } from '../config.ts';
 import type { ChatScope, Logger, QuotedAttachment, RawAttachment, ReplyTarget } from '../types.ts';
 import {
@@ -90,6 +91,7 @@ export async function handleInbound(
   manager: SessionManager,
   config: ImQQBotConfig,
   logger: Logger,
+  bridge?: SessionBridge,
 ): Promise<void> {
   const msg = ctx.message as unknown as ProcessedMessage;
   const mwState = ctx.state as MiddlewareState;
@@ -108,6 +110,28 @@ export async function handleInbound(
   const agentBody = assembleAgentBody(msg, mwState, scope, logger);
 
   if (!agentBody) return;
+
+  // ── 已绑定宿主会话：直接投递，不创建插件私有 agent ──
+  // 绑定由 /use 或 /new 建立；没有绑定时走原来的 per-peer 会话路径。
+  if (bridge !== undefined && bridge.available) {
+    const bound = bridge.current(peerKeyOf(config, scope, peerId));
+    if (bound !== undefined) {
+      try {
+        await bridge.prompt(bound, agentBody);
+        logger.info(`bridged → session ${bound.slice(0, 8)}`);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        logger.error(`bridge prompt failed: ${message}`);
+        try {
+          await bot.sendMarkdown(replyTarget, `⚠️ 投递到绑定会话失败：${message}`);
+        } catch {
+          // 兜底提示也失败时只能记日志，避免二次异常
+        }
+      }
+      return;
+    }
+  }
+
 
   logger.info(`Processing: scope=${scope} peerId=${peerId} body="${agentBody.slice(0, 200)}"`);
 

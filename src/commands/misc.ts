@@ -10,7 +10,7 @@ import { getScopePeer, PLUGIN_VERSION } from '../shared/index.ts';
 /** /bot-ping — 测试当前 dsh 与 QQ 连接的网络延迟 */
 export function pingCommand(): CategorizedCommand {
   return {
-    name: 'bot-ping',
+    name: ['bot-ping', 'ping'],
     category: 'qqbot',
     description: '测试当前 dsh 与 QQ 连接的网络延迟',
     usage: [
@@ -42,7 +42,7 @@ export function pingCommand(): CategorizedCommand {
 /** /bot-version — 查看版本信息 */
 export function versionCommand({ manager }: CommandDeps): CategorizedCommand {
   return {
-    name: 'bot-version',
+    name: ['bot-version', 'version'],
     category: 'qqbot',
     description: '查看版本信息',
     handler: () => {

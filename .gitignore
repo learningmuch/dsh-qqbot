@@ -2,7 +2,9 @@ node_modules/
 dist/
 docs/
 lib/
+.pnpm-store/
 .env
 .dsh-sessions/
 *.tsbuildinfo
 cordis.dev.yml
+.dsh-acl-recovery/

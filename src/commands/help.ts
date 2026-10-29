@@ -1,7 +1,7 @@
 /**
  * /bot-help — 查看所有指令，按「通用能力 / QQ 机器人特有」分组展示
  *
- * 通用能力：对应底层 dsh agent 能力（new/compact/model/stop），无前缀
+ * 通用能力：对应底层 dsh agent 能力与宿主会话绑定（new/reset/compact/model/preset/list/use/stop），无前缀
  * QQBot 特有：插件自身封装（bot-ping/bot-version/bot-status/bot-help），带 bot- 前缀
  */
 import type { CommandDeps, CategorizedCommand } from './types.ts';
@@ -13,7 +13,7 @@ export function helpCommand(
   allCommands: () => CategorizedCommand[],
 ): CategorizedCommand {
   return {
-    name: 'bot-help',
+    name: ['bot-help', 'help'],
     category: 'qqbot',
     description: '查看所有指令',
     handler: async (cmdCtx) => {
