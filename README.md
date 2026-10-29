@@ -33,6 +33,43 @@ QQ 用户 → QQ WebSocket → dsh-qqbot → ctx.agents → dsh agent loop → L
                                        (assistant reply → QQ sendMarkdown)
 ```
 
+## 本仓库：上游 fork + 宿主会话绑定
+
+本仓库是 [tencent-connect/dsh-qqbot](https://github.com/tencent-connect/dsh-qqbot) 的 fork，
+基础提交 `9d2cc6c`，在此之上加了一组**宿主会话绑定**能力：让 QQ 和你桌面版 / Web 里
+**正在用的那个会话**变成同一个，而不是插件另开一个私有会话。
+
+上游更新不会自动进来——fork 是拷贝，只有手动 `git fetch upstream && git merge upstream/main`
+才会同步。届时 `src/gateway/bootstrap.ts`、`src/transport/inbound.ts`、`src/commands/index.ts`、
+`README.md` 大概率有冲突，因为这几个文件双方都在改。
+
+> 英文版 [`README_EN.md`](./README_EN.md) 仍是上游内容，没有同步本 fork 的改动。
+
+### 相对上游的改动清单
+
+| 文件 | 类型 | 改动 |
+|---|---|---|
+| `src/bridge/binding-store.ts` | 新增 | 绑定持久化：`~/.dsh-qqbot/bindings.json`，`peerKey → sessionId` |
+| `src/bridge/session-bridge.ts` | 新增 | `SessionBridge`：宿主会话列表/解析/绑定/订阅、入站投递、出站转发、`/summary` 摘要 |
+| `src/bridge/index.ts` | 新增 | 模块出口 |
+| `src/commands/bridge.ts` | 新增 | `/list` `/list-all` `/use` `/current` `/unuse` `/new` `/status` `/watch` `/unwatch` `/search` `/summary` |
+| `src/setup/credential-probe.ts` | 新增 | 启动时凭据预检：只有平台明确返回 `100016` 才判定失效 |
+| `src/gateway/bootstrap.ts` | 改动 | 装配 `SessionBridge`；`ctx.inject` 获取 `sessionController`；已绑定会话按 500ms 轮询转发；凭据失效时打印修复引导 |
+| `src/transport/inbound.ts` | 改动 | 绑定优先：命中绑定就投递宿主会话，否则走原有私有会话 |
+| `src/commands/index.ts` `help.ts` `misc.ts` `types.ts` | 改动 | 注册新命令；`/help` `/ping` `/version` 增加无前缀别名 |
+| `src/gateway/middleware-setup.ts` | 改动 | 命令表接入 bridge |
+| `scripts/dev-dsh.ps1` | 新增 | 源码开发启动脚本（自动挑 ≥ 22.18 的 node，避开老 node 静默退出） |
+
+### 两个关键实现决定（踩过坑，不要改回去）
+
+1. **`sessionController` 必须用 `ctx.inject` 拿，不能在 `apply()` 里 `ctx.get`。**
+   它由 `@deepseek-ai/dsh-web-app` 注册，晚于本插件的 `apply`，启动瞬间拿到的一定是 `undefined`。
+2. **已绑定会话的出站是轮询，不是 `ctx.on('session/event')`。**
+   宿主会话在自己的 ctx 作用域派发事件，插件 fiber 是根 ctx 的另一个子节点，**兄弟作用域收不到彼此事件**；
+   只订阅事件会表现为「插件私有会话正常，绑定宿主会话永远没回复」。所以按 500ms 读
+   `sessions.get(id).snapshotEvents()`，用事件 `seq` 做水位——冷启动时宿主会把历史补进事件表，
+   只有按 `seq` 判定才不会把几小时前的旧回合重放一遍。
+
 ## 安装
 
 ### 方式一：桌面版安装（推荐）
@@ -88,6 +125,119 @@ npx @deepseek-ai/dsh --profile qqbot
 export QQBOT_APPID="你的AppID" QQBOT_SECRET="你的AppSecret"
 npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 ```
+
+## 部署与连接（实测流程）
+
+下面这套在 dsh 桌面版 `0.1.6-alpha.1` + 本插件 `0.5.4` 上跑通过。核心是四件事：
+**装进 profile → 给密钥 → 配默认模型 → 重启**。
+
+### 1. 装进桌面版 profile
+
+用官方 CLI，它会同时写 `dependencies`、`dsh.profile.bundles` 并跑 package transaction：
+
+```bash
+npx @deepseek-ai/dsh plugin --profile desktop add <本仓库绝对路径>
+# 从 npm 装：npx @deepseek-ai/dsh plugin --profile desktop add @tencent-connect/dsh-qqbot
+```
+
+装完确认 `~/.dsh/profiles/desktop/package.json` 里有：
+
+```json
+{
+  "dependencies": { "@tencent-connect/dsh-qqbot": "link:H:/workspace/dsh-qqbot" },
+  "dsh": { "profile": { "bundles": [ "...", "@tencent-connect/dsh-qqbot" ] } }
+}
+```
+
+> 不要手改这个文件。手工加的条目不在应用的 package transaction 记录里，
+> 卸载或升级桌面版时会被当成"不认识的条目"清掉，表现为插件突然消失、`/list` 没反应。
+
+### 2. 给密钥（三种方式任选其一）
+
+**A. 扫码（最省事）**：装好后重启，插件发现没有凭据会自动进扫码流程（应用内绑定页 / 终端二维码）。
+扫完凭据自动写入 `~/.dsh/profiles/desktop/cordis.patch.yml`：
+
+```yaml
+- id: im-qqbot
+  config:
+    appId: "1234567890"
+    appSecret: 你的AppSecret
+```
+
+**B. 写全局 `.env`（换机器只改一个文件，推荐）**
+
+`~/.dsh/.env`：
+
+```dotenv
+QQBOT_APPID=1234567890
+QQBOT_SECRET=你的AppSecret
+```
+
+profile patch 里让字段引用环境变量（也可以完全不写这两个字段）：
+
+```yaml
+- id: im-qqbot
+  config:
+    appId: "__FROM_ENV__"
+    appSecret: "__FROM_ENV__"
+```
+
+`__FROM_ENV__` 的意思是「这个字段去读对应环境变量」（`QQBOT_APPID` / `QQBOT_SECRET`）。
+
+**C. 直接写字面值**：在 profile 的 `cordis.patch.yml` 里写死 `appId` / `appSecret`。
+
+> **优先级：profile patch 里的字面值 > 环境变量。** 两处都写时以 patch 为准，
+> 排查"明明改了 `.env` 却没生效"先看 patch。
+> `.env` 里 `=` 两边不要空格、值不要引号；从开放平台复制时注意别把打码值（`****`）当成密钥。
+
+### 3. 配默认模型（最容易漏）
+
+拿不到模型路由时宿主会回落内置的 `deepseek-official`，没配 `DEEPSEEK_API_KEY` 就报：
+
+```
+MISSING_CREDENTIAL: llm-deepseek: no API key for provider route "deepseek-official"
+```
+
+用第三方网关（例如 `wps`）时，在 `~/.dsh/settings.yaml` 指定默认路由：
+
+```yaml
+agent-default-model:
+  provider: wps
+  model: deepseek/deepseek-v4.1-flash
+```
+
+在桌面版设置页选一次模型效果相同（会写进 profile patch 的 `agent-default-model` 条目）。
+
+### 4. 重启并自检
+
+凭据与配置只在进程启动时读一次，改完必须重启。启动日志里应该有这两行：
+
+```
+[im-qqbot] 会话绑定已启用（sessionController 可用）
+[im-qqbot] Bot ready! appId=1234567890
+```
+
+第一行说明读到了宿主会话（依赖 `dsh-web-app`），第二行说明 QQ 网关连上了。
+
+### 5. 在 QQ 里验证
+
+```
+/list          → 宿主会话列表（显示 10/56 这样，还有 N 个用 /list-all）
+/use 3         → 绑定第 3 个（或 /use a1b2c3d4 用 ID 前缀）
+/current       → 确认当前绑定
+（直接说话）    → 消息进宿主会话，回复约 1 秒内同步回 QQ
+/unuse         → 解除绑定
+```
+
+### 常见故障对照
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| 发 `/list` 完全没反应 | 插件没被加载 | 查 `profiles/desktop/package.json` 的 `bundles` 与 `node_modules` 链接；确认装的时候走的是官方 CLI |
+| 命令有反应，普通消息报 `MISSING_CREDENTIAL` | 默认模型没配 | 见第 3 步 |
+| 日志出现 `已存凭据已失效（invalid appid or secret）` | 密钥被平台轮换 | 重新扫码，或把新 AppSecret 写回 `.env` / patch 后重启 |
+| 桌面版里能看到回复，QQ 里没有 | 出站转发异常 | 用 `/bot-version` 确认版本含轮询转发；确认该 peer 已 `/use` 绑定；看日志有没有 `bridge: 轮询 … 失败` |
+| 平台显示密钥正确，插件仍报凭据无效 | 复制时带了空格/引号，或粘的是打码后的值 | 在开放平台点「重置」后整段复制 |
 
 ## 配置项
 
@@ -206,7 +356,9 @@ npx @deepseek-ai/dsh web --patch /path/to/dsh-qqbot/cordis.dev.yml
 |------|------|
 | 绑定落盘 | `~/.dsh-qqbot/bindings.json`，按 `qqbot:<appId>:<scope>:<peerId>` 存 sessionId，进程重启后仍有效 |
 | 入站 | `handleInbound` 前置分流：有绑定且能力可用 → `bridge.prompt()`，失败回一句 `⚠️ 投递到绑定会话失败：…` |
-| 出站 | 监听 `session/event` 的 `turn/end`，取本轮 `assistant/message` 文本转发；插件私有会话不参与转发 |
+| 出站 | 500ms 轮询已绑定会话的 `snapshotEvents()`，遇 `turn/end` 取出本轮 `assistant/message` 文本转发；插件私有会话不参与转发 |
+| 为什么轮询 | 宿主会话在自己 ctx 作用域派发 `session/event`，插件 fiber 是根 ctx 的兄弟节点，收不到——只订阅事件会导致绑定会话永远没回复 |
+| 事件载荷 | 宿主 `assistant/message` 的文本在 `data.message.content[]`（不是 `data.content[]`），两种形状都兼容 |
 | 中继保真度 | 按轮转发纯文本（无流式增量、无工具卡片、无附件）——刻意收窄，避免与流式出站路径互相干扰 |
 
 ## 核心模块
@@ -222,7 +374,8 @@ src/
 │   ├── bind-routes.ts          # 端内绑定页路由（/qqbot/im-qqbot/bind）
 │   ├── presenters.ts           # 呈现策略（终端/浏览器降级）
 │   ├── qr-svg.ts               # 二维码 SVG 渲染（宿主侧）
-│   └── persist.ts              # 凭据写入 cordis.patch.yml
+│   ├── persist.ts              # 凭据写入 cordis.patch.yml
+│   └── credential-probe.ts     # 启动时凭据预检（只认 100016）
 ├── client/                     # 浏览器半边（dsh.client Web Bundle）
 │   ├── index.ts                # 侧栏 Tab 注册 + 待绑定自动引导
 │   └── bind-page.ts             # 端内绑定页（二维码 + 状态轮询）
