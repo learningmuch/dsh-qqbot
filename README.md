@@ -229,6 +229,29 @@ agent-default-model:
 /unuse         → 解除绑定
 ```
 
+### 6. 日常运行（关机 / 重启之后）
+
+QQ 机器人不是一个独立后台服务，它是**桌面版进程内的插件**：应用启动 → 插件加载 → 连 QQ。
+所以"运行机器人"就等于"打开桌面版应用"，启动后等十几秒即可在 QQ 里发 `/bot-ping` 自检。
+
+重启后**不需要**重做任何配置，这些都持久化了：
+
+| 项 | 存放位置 |
+|---|---|
+| `appId` / `appSecret` | profile 的 `cordis.patch.yml`（`im-qqbot` 条目） |
+| 默认模型 | 同上（`agent-default-model` 条目） |
+| QQ 会话 ↔ 宿主会话绑定 | `~/.dsh-qqbot/bindings.json` |
+| 插件是否启用 | profile 的 `package.json`（由 `dsh plugin add` 维护） |
+
+唯一需要人工介入的情况是**平台轮换了 AppSecret**：日志打印 `已存凭据已失效（invalid appid or secret）`，
+插件会自动转入扫码流程，扫一次即可。
+
+**开机自启**（可选）：`Win+R` → `shell:startup` → 把开始菜单里的 `DeepSeek Harness` 快捷方式复制进去。
+应用没有静默启动参数，启动时窗口会出现（可把快捷方式属性里的"运行方式"设为最小化）。
+
+**会离线的情况**：关闭应用、电脑睡眠/休眠（应用被挂起，WebSocket 断开）、断网。
+唤醒或恢复网络后一般会自动重连，用 `/bot-ping` 确认；没有恢复就重启应用。
+
 ### 常见故障对照
 
 | 现象 | 原因 | 处理 |
